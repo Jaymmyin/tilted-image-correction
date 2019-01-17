@@ -1,309 +1,669 @@
-
+Ôªø
 #include "PPTRestoreClassHead.h"
-#include <numeric>
-struct PPTRestore::Ximpl
+
+template<class T>
+class Types
 {
-	enum imageStyle { normal, leanToRight, leanToLeft };
-	int cannyThreshold;
-	Mat srcImage, dstImage;
-	Mat midImage, edgeDetect;
-	Mat afterEnhance;
-	vector<Point> resultPointsByEdge;
-	vector<Point> resultPointsByContours;
-	vector<Vec4i> lines;
-
-	vector<Point> axisSort(const vector<Vec4i>& lines);
-	vector<Point> pointsFilter(const vector<Point>& candidates);//∂‘∏˜œﬂ∂Œ∆ ºµ„π˝¬À
-	vector<Point> findCrossPoint(const vector<Vec4i>& lines);	//∏˘æ›÷±œﬂÃ·»°»∑∂®æÿ–Œ4∏ˆ∂•µ„
-
-	vector<Point> axisSort(const vector<vector<Point>>& contours);
-	vector<Point> findCrossPoint(const vector<vector<Point>>& contours);//∏˘æ›¬÷¿™Ã·»°4∏ˆ∂•µ„
-
-	void loadImage(const string& name);//º”‘ÿÕºœÒ
-	void doEdgeDetect();//±ﬂ‘µÃ·»°
-	void doFindcontours();//¬÷¿™Ã·»°
-	void doAffineTransform();//Õ∏ ”±‰ªª
-	void dstImageEnhance();//Õº«ø‘ˆ«ø
+public:
+	using paii = pair<Point2f, T>;
+	struct AscendingCmp
+	{
+		bool operator()(paii p1, paii p2)
+		{
+			return p1.second > p2.second;
+		}
+	};
+	using ascend_distance = priority_queue<paii, vector<paii>, AscendingCmp>;
 };
 
-PPTRestore::PPTRestore() : pImpl(new Ximpl()){}
-PPTRestore::PPTRestore(const PPTRestore& other) : pImpl(new Ximpl(*other.pImpl)){}
+class Debug
+{
+public:
+	template<template<class, class...> class ContainerType, class ValueType, class... Args>
+	void print(const ContainerType<ValueType, Args...>& c)
+	{
+		if (PLATFORM == "WIN32")
+			for (const auto& v : c)
+			{
+				cout << v << endl;
+			}
+	}
+
+	template<template<class, class, class> class ContainerType, class ValueType, class Cmp>
+	void print(ContainerType<ValueType, vector<ValueType>, Cmp> q)
+	{
+		if (PLATFORM == "WIN32")
+			while (!q.empty())
+			{
+				auto p = q.top();
+				cout << p << endl;
+				q.pop();
+			}
+	}
+
+	template<class T, class U>
+	friend ostream& operator<< (ostream& out, const pair<T, U>& p);
+	friend ostream& operator<< (ostream& out, const Vec4f& v);
+
+	void show_img(const string& windowName, const Mat& src, bool show = true)
+	{
+		if (PLATFORM == "WIN32")
+			if (show) imshow(windowName, src);
+	}
+};
+
+template<class T, class U>
+ostream& operator<< (ostream& out, const pair<T, U>& p)
+{
+	out << "(" << p.first << "," << p.second << ")";
+	return out;
+}
+
+ostream& operator<< (ostream& out, const Vec4f& v)
+{
+	out << "start point: (" << v[0] << "," << v[1] << ") " << "end point: (" << v[2] << "," << v[3] << ")";
+	return out;
+}
+
+class Extreme_Img_Helper
+{
+public:
+	Mat& cut(Mat&);
+	vector<Point2f> deal(const vector<Point2f>& line_nodes, const vector<Point2f>& corner_nodes);
+private:
+	enum class state;
+};
+
+unordered_map<string, Mat> PPTRestore::tempImg;
+
+struct PPTRestore::Ximpl
+{
+	Mat srcImage;
+	Mat afterCanny;
+	vector<Point2f> hull_points;
+
+	Mat preprocess_image(Mat&);
+	vector<Point2f> corner_dectection(Mat&);
+	vector<Vec4f> edge_detection(Mat&);
+
+	map<float, Vec4f> find_cross_points_by_edges(const vector<Vec4f>& lines);
+	vector<Point2f> edge_corner_candidates(const map<float, Vec4f>&, const vector<Point2f>&);
+	vector<Point2f> cal_final_points(const vector<Point2f>& line_nodes, const vector<Point2f>& corner_nodes);
+	vector<vector<Point2f>> divide_points_into_4_parts(const vector<Point2f>& nodes);
+	Point2f& find_closest_points(const vector<Point2f>& line_nodes, const vector<Point2f>& corner_nodes);
+	vector<Point2f> cal_points_with_lines(const vector<Vec4f>&);
+	Point2f line_intersection(const Point2f& o1, const Point2f& p1, const Point2f& o2, const Point2f& p2);
+	void test(Mat);
+	Mat perspective_transformation(const vector<Point2f>&, Mat&);
+	Mat image_enhance(Mat&);
+	Debug* debug;
+	Extreme_Img_Helper* helper;
+};
+
+PPTRestore::PPTRestore() : pImpl(new Ximpl()) {}
+
+PPTRestore::PPTRestore(const PPTRestore& other) : pImpl(new Ximpl(*other.pImpl)) {}
+
 PPTRestore& PPTRestore::operator=(PPTRestore other)
 {
 	std::swap(other.pImpl, this->pImpl);
 	return *this;
 }
+
 PPTRestore::~PPTRestore()
 {
 	delete pImpl;
 	pImpl = nullptr;
 }
 
-//Õ®π˝(…Ë÷√…œœﬁµƒ)±ﬂ‘µÃ·»°µ√µΩÀƒ∏ˆ∂•µ„
-vector<Point> PPTRestore::Ximpl::pointsFilter(const vector<Point>& candidate)
+pair<double, double> autoCanny(Mat Input)
 {
-	vector<Point> candidates(candidate);
-	vector<Point> filter(candidate);
-	for (auto i = candidates.begin(); i != candidates.end();)
-	for (auto j = filter.begin(); j != filter.end(); ++j)
-	{
-		if (abs((*i).x - (*j).x) < 5 && abs((*i).y - (*j).y) < 5 && abs((*i).x - (*j).x) > 0 && abs((*i).y - (*j).y) > 0)
-			i = filter.erase(i);
-		else
-			++i;
-	}
-	return filter;
-}
-vector<Point> PPTRestore::Ximpl::axisSort(const vector<Vec4i>& lines)
-{
-	vector<Point> points(lines.size() * 2);//∏˜∏ˆœﬂ∂Œµƒ∆ ºµ„
-	for (size_t i = 0; i < lines.size(); ++i)//Ω´Vec4i◊™Œ™point
-	{
-		points[i * 2].x = lines[i][0];
-		points[i * 2].y = lines[i][1];
-		points[i * 2 + 1].x = lines[i][2];
-		points[i * 2 + 1].y = lines[i][3];
-	}
-	points = this->pointsFilter(points);//∂‘◊‘º∫π˝¬À“ª¥Œ
-	/*for (auto i : points)
-	cout << i.x << " " << i.y << endl;*/
-	sort(points.begin(), points.end(), CmpDistanceToZero());
-	return points;
-}
-void PPTRestore::Ximpl::doEdgeDetect()
-{
-	this->cannyThreshold = 80;
-	float factor = 2.5;
-	const int maxLinesNum = 10;//◊Ó∂‡ºÏ≤‚≥ˆµƒ÷±œﬂÃı ˝
-	Canny(this->srcImage, this->midImage, this->cannyThreshold, this->cannyThreshold * factor);
-	threshold(this->midImage, this->midImage, 128, 255, THRESH_BINARY);
-	cvtColor(this->midImage, this->edgeDetect, CV_GRAY2RGB);
-	HoughLinesP(this->midImage, this->lines, 1, CV_PI / 180, 50, 100, 100);
-
-	while (this->lines.size() >= 30)
-	{
-		this->cannyThreshold += 2;
-		Canny(this->srcImage, this->midImage, this->cannyThreshold, this->cannyThreshold * factor);
-		threshold(this->midImage, this->midImage, 128, 255, THRESH_BINARY);
-		cvtColor(this->midImage, this->edgeDetect, CV_GRAY2RGB);
-		HoughLinesP(this->midImage, this->lines, 1, CV_PI / 180, 50, 100, 100);
-	}
-	cout << "cannyThreshold1:" << this->cannyThreshold << endl;
-
-	Canny(this->srcImage, this->midImage, this->cannyThreshold, this->cannyThreshold * factor);
-	threshold(this->midImage, this->midImage, 128, 255, THRESH_BINARY);
-	cvtColor(this->midImage, this->edgeDetect, CV_GRAY2RGB);
-	HoughLinesP(this->midImage, this->lines, 1, CV_PI / 180, 50, 100, 100);
-
-	const int imageRow = this->midImage.rows;
-	const int imageCol = this->midImage.cols;
-
-
-	lines.erase(remove_if(lines.begin(), lines.end(), IsCloseToEdge()), lines.end());
-
-	for (size_t i = 0; i < this->lines.size(); i++)
-	{
-		Vec4i l = this->lines[i];
-		line(this->edgeDetect, Point(l[0], l[1]), Point(l[2], l[3]), Scalar(186, 88, 255), 1, CV_AA);
-	}
-
-
-	this->findCrossPoint(this->lines);
-	/*for (size_t i = 0; i < lines.size(); ++i)
-	cout << lines[i] << endl;*/
-	imshow("°æ±ﬂ‘µÃ·»°–ßπ˚Õº°ø", this->edgeDetect);
-}
-vector<Point> PPTRestore::Ximpl::findCrossPoint(const vector<Vec4i>& lines)//Õ®π˝÷±œﬂ’“µ„
-{
-	int rightTopFlag = 0;
-	int leftDownFlag = 0;
-	int diagLength = 0;//∂‘Ω«œﬂ≥§∂»
-	vector<Point> temp = this->axisSort(lines);
-	Point leftTop, rightDown;//◊Û…œ∫Õ”“œ¬ø…“‘÷±Ω”≈–∂œ
-	vector<Point> rightTop(temp.size());
-	vector<Point> leftDown(temp.size());//◊Ûœ¬∫Õ”“…œ”–∂‡∏ˆµ„ø…ƒ‹∑˚∫œ
-	//∂‘PPT’’∆¨∂¯—‘£¨“ª∂® «◊Û…œΩ«¿Î‘≠µ„◊ÓΩ¸£¨”“œ¬Ω«¿Î‘≠µ„◊Ó‘∂
-	leftTop.x = temp[0].x;
-	leftTop.y = temp[0].y;
-	rightDown.x = temp[temp.size() - 1].x;
-	rightDown.y = temp[temp.size() - 1].y;
-	for (auto & i : temp)
-	if (i.x > leftTop.x && i.y < rightDown.y)
-		rightTop.push_back(i);
-	for (auto & i : temp)
-	if (i.y > leftTop.y && i.x < rightDown.x)
-		leftDown.push_back(i);
-
-	diagLength = (leftTop.x - rightDown.x) * (leftTop.x - rightDown.x) + (leftTop.y - rightDown.y) * (leftTop.y - rightDown.y);
-	rightTop.erase(remove(rightTop.begin(), rightTop.end(), Point(0, 0)), rightTop.end());
-	leftDown.erase(remove(leftDown.begin(), leftDown.end(), Point(0, 0)), leftDown.end());
-	//…æ≥˝“ÚÕºœÒª˚±‰∂‘º∆À„¡Ω∏ˆæ‡¿Î◊Ó≥§µ„∂‘µƒ”∞œÏµƒµ„
-	for (auto i = rightTop.begin(); i != rightTop.end();)
-	{
-		if (((*i).x - leftTop.x) * ((*i).x - leftTop.x) + ((*i).y - leftTop.y) * ((*i).y - leftTop.y) < diagLength / 8)
-			i = rightTop.erase(i);
-		else
-			++i;
-	}
-
-	/*for (auto i : rightTop)
-	cout << "”“…œªπ”–£∫" << i.x << " " << i.y << endl;*/
-
-	int maxDistance = (rightTop[0].x - leftDown[0].x) * (rightTop[0].x - leftDown[0].x) + (rightTop[0].y - leftDown[0].y) * (rightTop[0].y - leftDown[0].y);
-
-	for (size_t i = 0; i < rightTop.size(); ++i)
-	for (size_t j = 0; j < leftDown.size(); ++j)
-	if ((rightTop[i].x - leftDown[j].x) * (rightTop[i].x - leftDown[j].x) + (rightTop[i].y - leftDown[j].y) * (rightTop[i].y - leftDown[j].y) > maxDistance)
-	{
-		maxDistance = (rightTop[i].x - leftDown[j].x) * (rightTop[i].x - leftDown[j].x) + (rightTop[i].y - leftDown[j].y) * (rightTop[i].y - leftDown[j].y);
-		rightTopFlag = i;
-		leftDownFlag = j;
-	}
-
-	/*cout << rightTop[rightTopFlag].x << " " << rightTop[rightTopFlag].y << endl;
-	cout << leftDown[leftDownFlag].x << " " << leftDown[leftDownFlag].y << endl;*/
-
-	/*for (auto i : rightTop)
-	cout << i.x << " " << i.y << endl;*/
-
-	/*for (auto i : leftdown)
-	cout << i.x << " " << i.y << endl;*/
-
-	this->resultPointsByEdge.push_back(leftTop);
-	this->resultPointsByEdge.push_back(rightTop[rightTopFlag]);
-	this->resultPointsByEdge.push_back(leftDown[leftDownFlag]);
-	this->resultPointsByEdge.push_back(rightDown);
-	return this->resultPointsByEdge;
+	Input = Input.reshape(0, 1); // spread Input Mat to single row
+	vector<double> vecFromMat;
+	Input.copyTo(vecFromMat); // Copy Input Mat to vector vecFromMat
+	nth_element(vecFromMat.begin(), vecFromMat.begin() + vecFromMat.size() / 2, vecFromMat.end());
+	double v = vecFromMat[vecFromMat.size() / 2];
+	double sigma = 0.333;
+	int lower = int(max(0, int((1.0 - sigma) * v)));
+	int upper = int(min(255, int((1.0 + sigma) * v)));
+	return{ lower, upper };
 }
 
-
-//Õ®π˝¬÷¿™Ã·»°µ√µΩÀƒ∏ˆ∂•µ„
-vector<Point> PPTRestore::Ximpl::axisSort(const vector<vector<Point>>& contours)
+double angle(Point pt1, Point pt2, Point pt0)
 {
-	vector<Point> points(contours.size() * contours[0].size());
-	for (auto i : contours)
-	for (auto j : i)
-		points.push_back(j);
-	points = this->pointsFilter(points);//∂‘◊‘º∫π˝¬À“ª¥Œ
-	points.erase(remove(points.begin(), points.end(), Point(0, 0)), points.end());
-	sort(points.begin(), points.end(), CmpDistanceToZero());
-	return points;
+	double dx1 = pt1.x - pt0.x;
+	double dy1 = pt1.y - pt0.y;
+	double dx2 = pt2.x - pt0.x;
+	double dy2 = pt2.y - pt0.y;
+	return (dx1*dx2 + dy1*dy2) / sqrt((dx1*dx1 + dy1*dy1)*(dx2*dx2 + dy2*dy2) + 1e-10);
 }
-void PPTRestore::Ximpl::doFindcontours()
+
+Mat PPTRestore::Ximpl::preprocess_image(Mat& img)
 {
-	const float approachMaxThreshold = 20;
-	Mat result(this->midImage.size(), CV_8U, Scalar(0));
+
+	Mat gray, edges;
+	cvtColor(img, gray, COLOR_BGR2GRAY);
+	pair<double, double> p = autoCanny(gray);
+	double lower = p.first, upper = p.second;
+	cout << lower << " " << upper << endl;
+
+	Canny(gray, edges, lower, upper);
+
 	vector<vector<Point>> contours;
-	findContours(this->midImage, contours, CV_RETR_EXTERNAL, CV_CHAIN_APPROX_NONE);
-	sort(contours.begin(), contours.end(), CmpContoursSize());
-	for (size_t i = 0; i < 5; ++i)//»•≥˝Ã˘Ω¸ÕºœÒ±ﬂ‘µµƒ¬÷¿™
+	findContours(edges.clone(), contours, RETR_EXTERNAL, CHAIN_APPROX_NONE);
+
+	if (contours.empty()) return img;
+
+	vector<vector<Point>> biggest_contours;
+	sort(contours.begin(), contours.end(), [](vector<Point> c1, vector<Point> c2) {return c1.size() > c2.size(); });
+
+	if (contours.size() >= 1) biggest_contours.emplace_back(contours[0]);
+	if (contours.size() >= 2) biggest_contours.emplace_back(contours[1]);
+	contours.erase(remove_if(contours.begin(), contours.end(), [](vector<Point> p) {return p.size() < 1000; }), contours.end());
+
+
+	Mat tmp = img.clone();
+	for (int i = 0; i < img.rows; ++i)
 	{
-		size_t j = contours[i].size();
-		if (contours[i][j / 5].y - 0 < approachMaxThreshold || this->midImage.cols - contours[i][j / 2].x < approachMaxThreshold)
-			contours.erase(remove(contours.begin(), contours.end(), contours[i]), contours.end());
+		for (int j = 0; j < img.cols; ++j)
+		{
+			tmp.at<Vec3b>(i, j)[0] = 255;
+			tmp.at<Vec3b>(i, j)[1] = 255;
+			tmp.at<Vec3b>(i, j)[2] = 255;
+		}
 	}
-	vector<vector<Point>> biggestContours;
-	for (size_t i = 0; i < 3; ++i)
-		biggestContours.push_back(contours[i]);
-	drawContours(result, biggestContours, -1, Scalar(255), 2);
-	imshow("¬÷¿™Ã·»°", result);
-	this->findCrossPoint(biggestContours);//Õ®π˝¥Û¬÷¿™’“µΩΩªµ„
-	/*this->candidatePoint.push_back(Point(250, 0));
-	this->candidatePoint.push_back(Point(512, 159));
-	this->candidatePoint.push_back(Point(186, 736));
-	this->candidatePoint.push_back(Point(475, 637));*/
+
+	vector<vector<Point>> polyContours(contours.size());
+	int maxArea = 0;
+	for (int index = 0; index < contours.size(); index++) {
+		if (contourArea(contours[index]) > contourArea(contours[maxArea]))
+			maxArea = index;
+		approxPolyDP(contours[index], polyContours[index], 10, true);
+	}
+
+	vector<RotatedRect> minRect(biggest_contours.size());
+	for (int i = 0; i < biggest_contours.size(); i++)
+		minRect[i] = minAreaRect(Mat(biggest_contours[i]));
+	Mat drawing = Mat::zeros(tmp.size(), CV_8UC3);
+	for (int i = 0; i< biggest_contours.size(); i++)
+	{
+		Scalar color = Scalar(0,255,0);
+		drawContours(drawing, biggest_contours, i, color, 1, 8, vector<Vec4i>(), 0, Point());
+		Point2f rect_points[4]; minRect[i].points(rect_points);
+		for (int j = 0; j < 4; j++)
+			line(drawing, rect_points[j], rect_points[(j + 1) % 4], color, 1, 8);
+	}
+
+	for (int i = 0; i< biggest_contours.size(); i++)
+	{
+		Scalar color = Scalar(255, 0, 0);
+		drawContours(drawing, biggest_contours, -1, Scalar(255), 2);
+		circle(drawing, minRect[i].center, 4, color, -1, 8, 0);
+	}
+	imshow("Contours", drawing);
+
+	unordered_map<string, int> table;
+	for (int i = 0; i < biggest_contours.size(); ++i)
+		table[to_string(int(minRect[i].center.x)) + to_string(int(minRect[i].center.y))] = i;
+	sort(minRect.begin(), minRect.end(), [&](RotatedRect r1, RotatedRect r2) {
+		return abs(r1.center.x - srcImage.cols / 2) + abs(r1.center.y - srcImage.rows / 2) <
+			abs(r2.center.x - srcImage.cols / 2) + abs(r2.center.y - srcImage.rows / 2);
+	});
+	auto centerRect = minRect[0];
+	vector<vector<Point>> centerRectContours;
+	centerRectContours.emplace_back(biggest_contours[table[to_string(int(centerRect.center.x)) + to_string(int(centerRect.center.y))]]);
+	
+	Mat polyPic = Mat::zeros(img.size(), CV_8UC3);
+	drawContours(polyPic, polyContours, maxArea, Scalar(0, 0, 255/*rand() & 255, rand() & 255, rand() & 255*/), 2);
+
+	vector<int>  hull;
+	convexHull(polyContours[maxArea], hull, false);    //Ê£ÄÊµãËØ•ËΩÆÂªìÁöÑÂá∏ÂåÖ
+
+	for (int i = 0; i < hull.size(); ++i) {
+		circle(polyPic, polyContours[maxArea][i], 10, Scalar(rand() & 255, rand() & 255, rand() & 255), 3);
+		hull_points.emplace_back(polyContours[maxArea][i]);
+	}
+
+	addWeighted(polyPic, 0.5, img, 0.5, 0, img);
+
+	imshow("beforetmp", tmp);
+
+	for (int i = 0; i < centerRectContours.size(); ++i)
+	{
+		for (int j = 0; j < centerRectContours[i].size(); ++j)
+		{
+			tmp.at<Vec3b>(centerRectContours[i][j].y, centerRectContours[i][j].x)[0] = 0;
+			tmp.at<Vec3b>(centerRectContours[i][j].y, centerRectContours[i][j].x)[1] = 0;
+			tmp.at<Vec3b>(centerRectContours[i][j].y, centerRectContours[i][j].x)[2] = 0;
+		}
+	}
+
+	imshow("tmp", tmp);
+
+	//Mat src_gray, after_gaus, res;
+	//string source_window = "pre_process";
+
+	//cvtColor(img, src_gray, CV_BGR2GRAY);
+	//GaussianBlur(src_gray, after_gaus, Size(9, 9), 0, 0);
+	//auto kernel = getStructuringElement(MORPH_RECT, Size(25, 25));
+	//dilate(after_gaus, res, kernel);
+	//debug->show_img(source_window, res);
+	//PPTRestore::tempImg["pre_process"] = res;
+
+	return tmp;
 }
-vector<Point> PPTRestore::Ximpl::findCrossPoint(const vector<vector<Point>>& contours)//Õ®π˝¬÷¿™’“µ„
+
+vector<Point2f> PPTRestore::Ximpl::corner_dectection(Mat& src)
 {
-	int imageState;//Õº∆¨»Á∫Œ«„–±
-	vector<Point> temp = this->axisSort(contours);
-	Point leftTop, trueRightTop, trueLeftDown, rightDown;//◊Û…œ∫Õ”“œ¬ø…“‘÷±Ω”≈–∂œ
-	vector<Point> rightTop(temp.size());
-	vector<Point> leftDown(temp.size());//◊Ûœ¬∫Õ”“…œ”–∂‡∏ˆµ„ø…ƒ‹∑˚∫œ
-	//∂‘PPT’’∆¨∂¯—‘£¨“ª∂® «◊Û…œΩ«¿Î‘≠µ„◊ÓΩ¸£¨”“œ¬Ω«¿Î‘≠µ„◊Ó‘∂
-	leftTop.x = temp[0].x;
-	leftTop.y = temp[0].y;
-	rightDown.x = temp[temp.size() - 1].x;
-	rightDown.y = temp[temp.size() - 1].y;
+	vector<Point2f> corners;
+	float qualityLevel = 0.01;
+	float minDistance = 10;
+	int blockSize = 3;
+	bool useHarrisDetector = false;
+	float k = 0.04;
 
-	for (auto & i : temp)
-	if (i.x > leftTop.x && i.y < rightDown.y)
-		rightTop.push_back(i);
-	for (auto & i : temp)
-	if (i.y > leftTop.y && i.x < rightDown.x)
-		leftDown.push_back(i);
+	int maxCorners = 23;
+	int maxTrackbar = 100;
+	RNG rng(12345);
+	string source_window = "corner";
+	goodFeaturesToTrack(src, corners, maxCorners, qualityLevel, minDistance, Mat(), blockSize, useHarrisDetector, k);
 
-	if (rightTop.end() == find_if(rightTop.begin(), rightTop.end(), [leftTop, rightTop](Point p){return p.y < leftTop.y; }))
-		imageState = imageStyle::leanToRight;//»Áπ˚À˘”–”“…œµ„µƒy÷µ∂º > ◊Û…œµ„µƒy÷µ £¨Àµ√˜ÕºœÒœÚ”“«„–±
-	else
-		imageState = imageStyle::leanToLeft;
-
-	if (imageState == imageStyle::leanToRight)//œÚ”“«„–±
+	Mat tmp = src.clone();
+	int r = 4;
+	for (int i = 0; i < corners.size(); i++)
 	{
-		sort(rightTop.begin(), rightTop.end(), [rightTop](Point p1, Point p2){return p1.x > p2.x; });//∂‘À˘”–”“…œµ„∞¥X÷µ≈≈–Ú£¨X◊Ó¥ÛµƒæÕ «’Ê’˝µƒ”“…œµ„
-		rightTop.erase(remove(rightTop.begin(), rightTop.end(), Point(0, 0)), rightTop.end());
-		trueRightTop = rightTop[0];
-		sort(leftDown.begin(), leftDown.end(), [leftDown](Point p1, Point p2){return p1.x < p2.x; });//∂‘À˘”–◊Ûœ¬µ„∞¥X÷µ≈≈–Ú£¨X◊Ó–°µƒæÕ «’Ê’˝µƒ◊Ûœ¬µ„
-		leftDown.erase(remove(leftDown.begin(), leftDown.end(), Point(0, 0)), leftDown.end());
-		trueLeftDown = leftDown[0];
-	}
-	else //œÚ◊Û«„–±
-	{
-		sort(rightTop.begin(), rightTop.end(), [rightTop](Point p1, Point p2){return p1.y < p2.y; });//∂‘À˘”–”“…œµ„∞¥Y÷µ≈≈–Ú£¨Y◊Ó–°µƒæÕ «’Ê’˝µƒ”“…œµ„
-		rightTop.erase(remove(rightTop.begin(), rightTop.end(), Point(0, 0)), rightTop.end());
-		trueRightTop = rightTop[0];
-		sort(leftDown.begin(), leftDown.end(), [leftDown](Point p1, Point p2){return p1.y > p2.y; });//∂‘À˘”–◊Ûœ¬µ„∞¥Y÷µ≈≈–Ú£¨Y◊Ó¥ÛµƒæÕ «’Ê’˝µƒ◊Ûœ¬µ„
-		leftDown.erase(remove(leftDown.begin(), leftDown.end(), Point(0, 0)), leftDown.end());
-		trueLeftDown = leftDown[0];
+		circle(tmp, corners[i], r, Scalar(255, 0, 0), -1, 8, 0);
 	}
 
-	//ofstream fout("result.txt");
-	//for (auto i : leftDown)
-	//	fout << "◊Ûœ¬ªπ”–£∫" << i.x << " " << i.y << endl;
-
-	//cout << "”“…œµ„£∫" << trueRightTop << endl
-	//	<< "◊Ûœ¬µ„£∫" << trueLeftDown << endl;
-
-
-	this->resultPointsByContours.push_back(leftTop);
-	this->resultPointsByContours.push_back(trueRightTop);
-	this->resultPointsByContours.push_back(trueLeftDown);
-	this->resultPointsByContours.push_back(rightDown);
-	return this->resultPointsByContours;
+	debug->show_img(source_window, tmp);
+	PPTRestore::tempImg["corner"] = tmp;
+	return corners;
 }
 
-void PPTRestore::Ximpl::loadImage(const string& name)
+void PPTRestore::Ximpl::test(Mat src)
 {
-	srcImage = imread(name, 1);
-	if (!srcImage.data)
+	Mat dst = afterCanny;
+	const float approachMaxThreshold = 20;
+	vector<vector<Point>> contours;
+	findContours(dst, contours, CV_RETR_EXTERNAL, CV_CHAIN_APPROX_NONE);
+	Mat result = Mat::zeros(dst.size(), CV_8UC1);
+	if (!contours.empty())
 	{
-		cout << "∂¡»°Õº∆¨¥ÌŒÛ£¨«Î»∑∂®ƒø¬ºœ¬ «∑Ò”–imread∫Ø ˝÷∏∂®µƒÕº∆¨¥Ê‘⁄" << endl;
+		//result:Â≠òÊîæËΩÆÂªìÔºåcontoursÔºöÊâæÂà∞ÁöÑËΩÆÂªìÔºå-1ÔºöÂ∞ÜÊâÄÊúâËΩÆÂªìÁîªÂá∫ÔºåScalar(255)ÔºöÁôΩËâ≤ÁîªÁ¨îÔºå2Ôºö‰∏∫ÁîªÁ¨îÁ≤óÁªÜ
+		drawContours(result, contours, -1, Scalar(255), 2);
+		imshow("Â§ÑÁêÜÂõæ", result);
 	}
-	imshow(WINDOW_NAME1, this->srcImage);
+
+	cout << contours.size() << endl;
+	cout << contours[0].size() << endl;
+
 }
-void PPTRestore::Ximpl::doAffineTransform()
+
+bool is_similar_line(const Vec4i& _l1, const Vec4i& _l2)
 {
-	this->doEdgeDetect();//∑¬…‰±‰ªª«∞œ»±ﬂ‘µ°¢÷±œﬂÃ·»°
-	//this->doFindcontours();//Ã·»°¬÷¿™
+	Vec4i l1(_l1), l2(_l2);
+
+	float length1 = sqrtf((l1[2] - l1[0])*(l1[2] - l1[0]) + (l1[3] - l1[1])*(l1[3] - l1[1]));
+	float length2 = sqrtf((l2[2] - l2[0])*(l2[2] - l2[0]) + (l2[3] - l2[1])*(l2[3] - l2[1]));
+
+	float product = (l1[2] - l1[0])*(l2[2] - l2[0]) + (l1[3] - l1[1])*(l2[3] - l2[1]);
+
+	if (fabs(product / (length1 * length2)) < cos(CV_PI / 30))
+		return false;
+
+	float mx1 = (l1[0] + l1[2]) * 0.5f;
+	float mx2 = (l2[0] + l2[2]) * 0.5f;
+
+	float my1 = (l1[1] + l1[3]) * 0.5f;
+	float my2 = (l2[1] + l2[3]) * 0.5f;
+	float dist = sqrtf((mx1 - mx2)*(mx1 - mx2) + (my1 - my2)*(my1 - my2));
+
+	if (dist > std::max(length1, length2) * 0.3f)
+		return false;
+
+	return true;
+}
+
+
+vector<Vec4f> PPTRestore::Ximpl::edge_detection(Mat& src)
+{
+	// to do
+	float alpha = 2.0; /*< Simple contrast control */
+	int beta = 1;       /*< Simple brightness control */
+	Mat dst = src;
+	Mat new_image = Mat::zeros(dst.size(), dst.type());
+	for (int y = 0; y < dst.rows; y++) {
+		for (int x = 0; x < dst.cols; x++) {
+			for (int c = 0; c < dst.channels(); c++) {
+				new_image.at<Vec3b>(y, x)[c] =
+					saturate_cast<uchar>(alpha*dst.at<Vec3b>(y, x)[c] + beta);
+			}
+		}
+	}
+ 	vector<Vec4f> lines;
+	src = dst;
+	Mat gray;
+	cvtColor(src, gray, COLOR_BGR2GRAY);
+	pair<double, double> p = autoCanny(gray);
+	double lower = p.first, upper = p.second;
+
+	Mat mid, edgeDetect;
+	Canny(src, mid, lower, upper, 3);
+	imshow("bbbbbb", mid);
+	//threshold(mid, mid, 128, 255, THRESH_BINARY);
+	cvtColor(mid, edgeDetect, CV_GRAY2RGB);
+
+	int min_line_length = 50;
+	int max_line_gap = 100;
+	HoughLinesP(mid,
+		lines,
+		1,
+		CV_PI / 180,
+		10,
+		min_line_length,
+		max_line_gap
+	);
+	cout << "lines.size()" << lines.size() << endl;
+	
+	afterCanny = mid;
+
+	// refine lines
+	struct IsCloseToEdge
+	{
+		bool operator()(Vec4f line)
+		{
+			return abs(line[0] - line[2]) < 10 || abs(line[1] - line[3]) < 10;
+		}
+	};
+	lines.erase(remove_if(lines.begin(), lines.end(), IsCloseToEdge()), lines.end());
+	if (lines.empty()) return{};
+
+	std::vector<int> labels;
+	int numberOfLines = cv::partition(lines, labels, is_similar_line);
+
+	vector<Vec4f> final_lines;
+	int max_size = *max_element(labels.begin(), labels.end());
+	for (int i = 0; i < max_size + 1; ++i)
+		final_lines.emplace_back(lines[find(labels.begin(), labels.end(), i) - labels.begin()]);
+
+	sort(final_lines.begin(), final_lines.end(), [](Vec4f v1, Vec4f v2) {return
+		pow(v1[0] - v1[2], 2) + pow(v1[1] - v1[3], 2) < pow(v2[0] - v2[2], 2) + pow(v2[1] - v2[3], 2) ; });
+	
+	final_lines.erase(remove_if(final_lines.begin(), final_lines.end(), [&](Vec4f v1)
+	{
+		auto v2 = final_lines.back(); 
+		return pow(v1[0] - v1[2], 2) + pow(v1[1] - v1[3], 2) 
+		< 0.2 * (pow(v2[0] - v2[2], 2) + pow(v2[1] - v2[3], 2)); 
+	}), final_lines.end());
+
+
+	for (size_t i = 0; i < final_lines.size(); i++)
+	{
+		Vec4i l = final_lines[i];
+		line(edgeDetect, Point(l[0], l[1]), Point(l[2], l[3]), Scalar(0, 0, 255), 1, CV_AA);
+	}
+
+	debug->show_img("„ÄêËæπÁºòÊèêÂèñÊïàÊûúÂõæ„Äë", edgeDetect);
+	return final_lines;
+}
+
+
+Point2f PPTRestore::Ximpl::line_intersection(const Point2f& o1, const Point2f& p1, const Point2f& o2, const Point2f& p2)
+{
+	Point2f x = o2 - o1;
+	Point2f d1 = p1 - o1;
+	Point2f d2 = p2 - o2;
+
+	float cross = d1.x*d2.y - d1.y*d2.x;
+	double t1 = (x.x * d2.y - x.y * d2.x) / cross;
+	return o1 + d1 * t1;
+}
+
+vector<Point2f> PPTRestore::Ximpl::cal_points_with_lines(const vector<Vec4f>& lines)
+{
+	cout << "size is : " << lines.size() << endl;
+	//left, right, up, down
+	vector<float> ratio;
+	vector<float> intersects;
+	for (int i = 0; i < lines.size(); ++i)
+	{
+		ratio.emplace_back((lines[i][3] - lines[i][1]) / (lines[i][2] - lines[i][0]));
+		intersects.emplace_back(lines[i][1] - ratio[i] * lines[i][0]);
+	}
+	
+	vector<Point2f> intersect_points;
+	const float height = srcImage.rows; // height
+	const float width = srcImage.cols; // width
+
+	Point2f center(width / 2, height / 2);
+
+	cout << height << endl;
+	cout << width << endl;
+
+	vector<Point2f> cross_points(hull_points);
+	int min_padding = 50;
+	for (int i = 0; i < lines.size(); ++i)
+	{
+		for (int j = i; j < lines.size(); ++j)
+		{
+			if (j == i) continue;
+			Point2f c = line_intersection(Point2f(lines[i][0], lines[i][1]), Point2f(lines[i][2], lines[i][3]),
+				Point2f(lines[j][0], lines[j][1]), Point2f(lines[j][2], lines[j][3]));
+			if (c.x < -min_padding || c.x > width + min_padding || c.y < -min_padding || c.y > height + min_padding) continue;
+			cross_points.emplace_back(c);
+		}
+	}
+
+	// add all line's edge point into cross_points
+	for (auto line : lines)
+	{
+		cross_points.emplace_back(Point2f(line[0], line[1]));
+		cross_points.emplace_back(Point2f(line[2], line[3]));
+	}
+
+
+	Mat t = srcImage.clone();
+	int r = 4;
+	for (int i = 0; i < cross_points.size(); i++)
+	{
+		circle(t, cross_points[i], r, Scalar(0, 255, 0), -1, 8, 0);
+	}
+	imshow("aaaaaaaaaaa", t);
+
+	vector<vector<Point2f>> _4_parts = divide_points_into_4_parts(cross_points);
+	vector<Point2f> a = _4_parts[0];
+	vector<Point2f> b = _4_parts[1];
+	vector<Point2f> c = _4_parts[2];
+	vector<Point2f> d = _4_parts[3];
+
+	//sort(a.begin(), a.end(), [&](Point2f p1, Point2f p2) {
+	//	return pow(center.y * 0 - p1.y, 2) + pow(center.x * 0 - p1.x, 2) < pow(center.y * 0 - p2.y, 2) + pow(center.x * 0 - p2.x, 2); });
+	//sort(b.begin(), b.end(), [&](Point2f p1, Point2f p2) {
+	//	return pow(center.y * 0 - p1.y, 2) + pow(center.x * 2 - p1.x, 2) < pow(center.y * 0 - p2.y, 2) + pow(center.x * 2 - p2.x, 2); });
+	//sort(c.begin(), c.end(), [&](Point2f p1, Point2f p2) {
+	//	return pow(center.y * 2 - p1.y, 2) + pow(center.x * 0 - p1.x, 2) < pow(center.y * 2 - p2.y, 2) + pow(center.x * 0 - p2.x, 2); });
+	//sort(d.begin(), d.end(), [&](Point2f p1, Point2f p2)  {
+	//	return pow(center.y * 2 - p1.y, 2) + pow(center.x * 2 - p1.x, 2) < pow(center.y * 2 - p2.y, 2) + pow(center.x * 2 - p2.x, 2); });
+	sort(a.begin(), a.end(), [&](Point2f p1, Point2f p2) {
+	return pow(center.y - p1.y, 2) + pow(center.x - p1.x, 2) < pow(center.y - p2.y, 2) + pow(center.x - p2.x, 2); });
+	sort(b.begin(), b.end(), [&](Point2f p1, Point2f p2) {
+	return pow(center.y - p1.y, 2) + pow(center.x - p1.x, 2) < pow(center.y - p2.y, 2) + pow(center.x - p2.x, 2); });
+	sort(c.begin(), c.end(), [&](Point2f p1, Point2f p2) {
+	return pow(center.y - p1.y, 2) + pow(center.x - p1.x, 2) < pow(center.y - p2.y, 2) + pow(center.x - p2.x, 2); });
+	sort(d.begin(), d.end(), [&](Point2f p1, Point2f p2) {
+	return pow(center.y - p1.y, 2) + pow(center.x - p1.x, 2) < pow(center.y - p2.y, 2) + pow(center.x - p2.x, 2); });
+	intersect_points.emplace_back(a.empty() ? Point2f(0, 0) : a.back());
+	intersect_points.emplace_back(c.empty() ? Point2f(srcImage.cols, 0) : c.back());
+	intersect_points.emplace_back(b.empty() ? Point2f(0, srcImage.rows) : b.back());
+	intersect_points.emplace_back(d.empty() ? Point2f(srcImage.cols, srcImage.rows) : d.back());
+	return intersect_points;
+}
+
+
+map<float, Vec4f> PPTRestore::Ximpl::find_cross_points_by_edges(const vector<Vec4f>& lines)
+{
+	Point2f left_top, right_top, left_down, right_down;
+	map<float, Vec4f> table_vec;
+	vector<float> ratios;
+	for (auto line : lines)
+	{
+		int start_x = line[0];
+		int start_y = line[1];
+		int end_x = line[2];
+		int end_y = line[3];
+		float ratio = (float)(end_y - start_y) / (float)(end_x - start_x);
+
+		table_vec[ratio] = line;
+	}
+
+	return table_vec;
+}
+
+vector<Point2f> PPTRestore::Ximpl::edge_corner_candidates(const map<float, Vec4f>& ratio_2points, const vector<Point2f>& corners)
+{
+	vector<float> intercepts;
+	vector<float> ratios;
+	vector<Point> points;
+	vector<Point2f> corner_nodes;
+
+	Types<float>::ascend_distance nodes_to_lines;
+	for (auto p : ratio_2points)
+	{
+		ratios.push_back(p.first);
+		intercepts.push_back((p.second)[1] - (p.first * (p.second)[0]));
+	}
+
+	for (int i = 0; i < corners.size(); ++i)
+	{
+		float min_dis = INT_MAX;
+		for (int j = 0; j < ratio_2points.size(); ++j)
+		{
+			float dis = (float)abs(ratios[j] * corners[i].x - corners[i].y + intercepts[j]) / (float)sqrt(pow(ratios[j], 2) + 1);
+			if (dis < min_dis)
+				min_dis = dis;
+		}
+		nodes_to_lines.push({ corners[i], min_dis });
+	}
+
+	int num = 100;
+
+	while (!nodes_to_lines.empty() && num > 0)
+	{
+		auto p = nodes_to_lines.top().first;
+		corner_nodes.emplace_back(Point2f(p.x, p.y));
+		nodes_to_lines.pop();
+		num--;
+	}
+
+	Mat to_show = srcImage;
+	Mat show_corner_Mat = to_show.clone();
+	RNG rng(12345);
+	int r = 4;
+	for (int i = 0; i < corner_nodes.size(); i++)
+	{
+		circle(show_corner_Mat, corners[i], r, Scalar(0, 255, 0), -1, 8, 0);
+	}
+	PPTRestore::tempImg["together"] = show_corner_Mat;
+	//transform the nodes in the ratio_2points int vector<Point2f>
+	vector<Point2f> line_nodes;
+	for (auto p : ratio_2points)
+	{
+		line_nodes.emplace_back(Point2f((float)p.second[0], (float)p.second[1]));
+		line_nodes.emplace_back(Point2f((float)p.second[2], (float)p.second[3]));
+	}
+
+
+	for (int i = 0; i < line_nodes.size(); i++)
+	{
+		circle(show_corner_Mat, line_nodes[i], r, Scalar(rng.uniform(0, 255), rng.uniform(0, 255),
+			rng.uniform(0, 255)), -1, 8, 0);
+	}
+	return cal_final_points(line_nodes, corner_nodes);
+}
+
+vector<Point2f> PPTRestore::Ximpl::cal_final_points(const vector<Point2f>& line_nodes, const vector<Point2f>& corner_nodes)
+{
+	vector<vector<Point2f>> line_temp = divide_points_into_4_parts(line_nodes);
+	vector<vector<Point2f>> corner_temp = divide_points_into_4_parts(corner_nodes);
+
+	vector<Point2f> left_top_line_nodes = line_temp[0], left_down_line_nodes = line_temp[1], right_top_line_nodes = line_temp[2], right_down_line_nodes = line_temp[3], res;
+	vector<Point2f> left_top_corner_nodes = corner_temp[0], left_down_corner_nodes = corner_temp[1], right_top_corner_nodes = corner_temp[2], right_down_corner_nodes = corner_temp[3];
+
+	res.emplace_back(find_closest_points(left_top_line_nodes, left_top_corner_nodes));
+	res.emplace_back(find_closest_points(right_top_line_nodes, right_top_corner_nodes));
+	res.emplace_back(find_closest_points(left_down_line_nodes, left_down_corner_nodes));
+	res.emplace_back(find_closest_points(right_down_line_nodes, right_down_corner_nodes));
+
+	return res;
+}
+
+Point2f& PPTRestore::Ximpl::find_closest_points(const vector<Point2f>& line_nodes, const vector<Point2f>& corner_nodes)
+{
+
+	if (line_nodes.size() == 1) return const_cast<Point2f&>(line_nodes[0]);
+	float min_dis = DBL_MAX;
+	int position = 0;
+	for (int i = 0; i < line_nodes.size(); ++i)
+	{
+		for (int j = 0; j < corner_nodes.size(); ++j)
+		{
+			if (pow(line_nodes[i].x - corner_nodes[j].x, 2) + pow(line_nodes[i].y - corner_nodes[j].y, 2) < min_dis)
+			{
+				min_dis = pow(line_nodes[i].x - corner_nodes[j].x, 2) + pow(line_nodes[i].y - corner_nodes[j].y, 2);
+				position = i;
+			}
+		}
+	}
+	return const_cast<Point2f&>(line_nodes[position]);
+}
+
+vector<vector<Point2f>> PPTRestore::Ximpl::divide_points_into_4_parts(const vector<Point2f>& line_nodes)
+{
+	vector<Point2f> left_top_line_nodes, left_down_line_nodes, right_top_line_nodes, right_down_line_nodes;
+	vector<vector<Point2f>> res;
+	int height = this->srcImage.cols / 2, width = this->srcImage.rows / 2;
+	float p1 = 1, p2 = 1; //tiao can
+	for (auto node : line_nodes)
+	{
+		if (node.x < height * p1)
+		{
+			if (node.y < width * p1)
+				left_top_line_nodes.emplace_back(node);
+			if (node.y > width * p2)
+				left_down_line_nodes.emplace_back(node);
+		}
+		if (node.x > height * p2)
+		{
+			if (node.y < width * p1)
+				right_top_line_nodes.emplace_back(node);
+			if (node.y > width * p2)
+				right_down_line_nodes.emplace_back(node);
+		}
+	}
+	res.emplace_back(left_top_line_nodes);
+	res.emplace_back(left_down_line_nodes);
+	res.emplace_back(right_top_line_nodes);
+	res.emplace_back(right_down_line_nodes);
+	return res;
+}
+
+Mat PPTRestore::Ximpl::perspective_transformation(const vector<Point2f>& final_points, Mat& src)
+{
+	debug->print(final_points);
 	Point2f _srcTriangle[4];
 	Point2f _dstTriangle[4];
 	vector<Point2f>srcTriangle(_srcTriangle, _srcTriangle + 4);
 	vector<Point2f>dstTriangle(_dstTriangle, _dstTriangle + 4);
+	Mat after_transform;
 
-	const int leftTopX = (this->resultPointsByEdge[0].x + this->resultPointsByEdge[0].x) / 2;
-	const int leftTopY = (this->resultPointsByEdge[0].y + this->resultPointsByEdge[0].y) / 2;
-	const int rightTopX = (this->resultPointsByEdge[1].x + this->resultPointsByEdge[1].x) / 2;
-	const int rightTopY = (this->resultPointsByEdge[1].y + this->resultPointsByEdge[1].y) / 2;
-	const int leftDownX = (this->resultPointsByEdge[2].x + this->resultPointsByEdge[2].x) / 2;
-	const int leftDownY = (this->resultPointsByEdge[2].y + this->resultPointsByEdge[2].y) / 2;
-	const int rightDownX = (this->resultPointsByEdge[3].x + this->resultPointsByEdge[3].x) / 2;
-	const int rightDownY = (this->resultPointsByEdge[3].y + this->resultPointsByEdge[3].y) / 2;
-
-	cout << leftTopX << " " << leftTopY << endl;
-	cout << rightTopX << " " << rightTopY << endl;
-	cout << leftDownX << " " << leftDownY << endl;
-	cout << rightDownX << " " << rightDownY << endl;
-
+	const int leftTopX = final_points[0].x;
+	const int leftTopY = final_points[0].y;
+	const int rightTopX = final_points[1].x;
+	const int rightTopY = final_points[1].y;
+	const int leftDownX = final_points[2].x;
+	const int leftDownY = final_points[2].y;
+	const int rightDownX = final_points[3].x;
+	const int rightDownY = final_points[3].y;
 
 	int newWidth = 0;
 	int newHeight = 0;
@@ -311,7 +671,7 @@ void PPTRestore::Ximpl::doAffineTransform()
 	newWidth = sqrt((leftTopX - rightTopX) * (leftTopX - rightTopX) + (leftTopY - rightTopY) * (leftTopY - rightTopY));
 	newHeight = sqrt((leftTopX - leftDownX) * (leftTopX - leftDownX) + (leftTopY - leftDownY) * (leftTopY - leftDownY));
 
-	this->dstImage = Mat::zeros(newHeight, newWidth, this->srcImage.type());
+	after_transform = Mat::zeros(newHeight, newWidth, src.type());
 
 	srcTriangle[0] = Point2f(leftTopX, leftTopY);
 	srcTriangle[1] = Point2f(rightTopX, rightTopY);
@@ -329,24 +689,45 @@ void PPTRestore::Ximpl::doAffineTransform()
 	Mat status;
 	Mat h = findHomography(m1, m2, status, 0, 3);
 	perspectiveTransform(srcTriangle, dstTriangle, h);
-	warpPerspective(this->srcImage, this->dstImage, h, this->dstImage.size());
-	imshow(WINDOW_NAME2, this->dstImage);
+	warpPerspective(src, after_transform, h, after_transform.size());
+	debug->show_img(WINDOW_NAME2, after_transform);
+	return after_transform;
 }
-void PPTRestore::Ximpl::dstImageEnhance()
+
+Mat PPTRestore::Ximpl::image_enhance(Mat& input)
 {
+	Mat output;
 	Mat kernel = (Mat_<float>(3, 3) << 0, -1, 0, -1, 5, -1, 0, -1, 0);
-	//Mat kernel = (Mat_<float>(5, 5) << 0, -1, 0, -1,0,-1,0,-1,0,-1,0,-1,14,-1,0, -1, 0, -1, 0,-1,0,-1,0,-1,0);
-	/*Mat kernel(3, 3, CV_32F, Scalar(-1)); 
-	kernel.at<float>(1, 1) =9;*/
-	//filter2D(this->dstImage, this->afterEnhance, this->dstImage.depth(), kernel);
-	filter2D(this->srcImage, this->afterEnhance, this->srcImage.depth(), kernel);
-	//imshow(WINDOW_NAME3, this->afterEnhance);
-	imwrite("result.jpg", afterEnhance);
+	filter2D(input, output, this->srcImage.depth(), kernel);
+	PPTRestore::tempImg["final"] = output;
+	return output;
 }
-void PPTRestore::imageRestoreAndEnhance(const string name)
+
+vector<Point2f> PPTRestore::get_points(Mat& image)
 {
-	//÷¥––À≥–Ú£∫º”‘ÿ‘≠Õº°¢–ﬁ’˝°¢‘ˆ«ø
-	this->pImpl->loadImage(name);
-	this->pImpl->doAffineTransform();
-	this->pImpl->dstImageEnhance();
+	PPTRestore::tempImg["raw"] = image;
+	this->pImpl->srcImage = image;
+	auto after_preprocess = this->pImpl->preprocess_image(image);
+
+	//auto corners = this->pImpl->corner_dectection(after_preprocess);
+
+
+	auto lines = this->pImpl->edge_detection(after_preprocess);
+	cout << lines.size() << endl;
+	if (lines.empty())return{ Point2f(0, 0), Point2f(image.cols, 0), Point2f(0, image.rows), Point2f(image.cols, image.rows) };
+
+	auto final_points_new = this->pImpl->cal_points_with_lines(lines);
+	//auto points_with_ratio = this->pImpl->find_cross_points_by_edges(lines);
+
+	// auto final_points = this->pImpl->edge_corner_candidates(points_with_ratio, corners);
+	get_image(image, final_points_new);
+	return final_points_new;
 }
+
+Mat PPTRestore::get_image(Mat& image, const vector<Point2f>& points)
+{
+	auto after_transform = this->pImpl->perspective_transformation(points, image);
+	auto final_mat = this->pImpl->image_enhance(after_transform);
+	return final_mat;
+}
+
